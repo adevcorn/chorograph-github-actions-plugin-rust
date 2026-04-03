@@ -1,0 +1,1 @@
+/Users/aavu/repositories/github.com/chorograph/chorograph-github-actions-plugin-rust/target/wasm32-unknown-unknown/release/chorograph_github_actions_plugin_rust.wasm: /Users/aavu/repositories/github.com/chorograph/chorograph-github-actions-plugin-rust/src/lib.rs

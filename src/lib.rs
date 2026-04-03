@@ -63,6 +63,12 @@ pub fn detect_run_status(workspace_root: String) -> RunStatus {
         };
     }
 
+    // Fetch open pull requests and emit a prList event.
+    let pr_json = fetch_prs(&workspace_root);
+    if !pr_json.is_empty() {
+        push_raw_event("", &pr_json);
+    }
+
     for wf_path in &wf_list {
         // Derive the repo-relative path for the API and the display name.
         // wf_path is absolute; strip workspace_root prefix to get the relative part.
@@ -89,30 +95,49 @@ pub fn detect_run_status(workspace_root: String) -> RunStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Action handler — on-demand job details
+// Action handler — on-demand job details and PR details
 // ---------------------------------------------------------------------------
 
 #[chorograph_plugin]
 pub fn handle_action(action_id: String, payload: serde_json::Value) {
-    if action_id != "fetch_ci_jobs" {
-        return;
-    }
-
-    let run_id = match payload.get("runId").and_then(|v| v.as_i64()) {
-        Some(id) => id,
-        None => {
-            log!("[github-actions] fetch_ci_jobs: missing runId in payload");
-            return;
+    match action_id.as_str() {
+        "fetch_ci_jobs" => {
+            let run_id = match payload.get("runId").and_then(|v| v.as_i64()) {
+                Some(id) => id,
+                None => {
+                    log!("[github-actions] fetch_ci_jobs: missing runId in payload");
+                    return;
+                }
+            };
+            let workspace_root = payload
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            fetch_jobs(run_id, &workspace_root);
         }
-    };
-
-    let workspace_root = payload
-        .get("workspaceRoot")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    fetch_jobs(run_id, &workspace_root);
+        "fetch_pr_details" => {
+            let number = match payload.get("number").and_then(|v| v.as_i64()) {
+                Some(n) => n,
+                None => {
+                    log!("[github-actions] fetch_pr_details: missing number in payload");
+                    return;
+                }
+            };
+            let workspace_root = payload
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            fetch_pr_details(number, &workspace_root);
+        }
+        _ => {
+            log!(
+                "[github-actions] handle_action: unknown action_id={}",
+                action_id
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +397,310 @@ fn fetch_jobs(run_id: i64, workspace_root: &str) {
         "[github-actions] emitting ciJobDetails for runId={} ({} jobs)",
         run_id,
         jobs_len
+    );
+
+    push_raw_event("", &event.to_string());
+}
+
+// ---------------------------------------------------------------------------
+// PR fetching
+// ---------------------------------------------------------------------------
+
+fn fetch_prs(workspace_root: &str) -> String {
+    log!(
+        "[github-actions] fetch_prs: workspace_root={}",
+        workspace_root
+    );
+
+    let cwd = if workspace_root.is_empty() {
+        None
+    } else {
+        Some(workspace_root)
+    };
+
+    let child = match ChildProcess::spawn(
+        "gh",
+        vec![
+            "pr",
+            "list",
+            "--json",
+            "number,title,isDraft,reviewDecision,statusCheckRollup,additions,deletions,changedFiles,headRefName,author,updatedAt,url",
+            "--limit",
+            "10",
+        ],
+        cwd,
+        HashMap::new(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            log!("[github-actions] gh pr list spawn failed: {:?}", e);
+            return String::new();
+        }
+    };
+
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    loop {
+        child.wait_for_data(300);
+        loop {
+            match child.read(PipeType::Stdout) {
+                Ok(ReadResult::Data(d)) => stdout_buf.extend(d),
+                _ => break,
+            }
+        }
+        match child.get_status() {
+            ProcessStatus::Running => {}
+            _ => {
+                loop {
+                    match child.read(PipeType::Stdout) {
+                        Ok(ReadResult::Data(d)) => stdout_buf.extend(d),
+                        _ => break,
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&stdout_buf);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return String::new();
+    }
+
+    let gh_prs: Vec<serde_json::Value> = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            log!("[github-actions] JSON parse error for pr list: {}", e);
+            return String::new();
+        }
+    };
+
+    let prs: Vec<serde_json::Value> = gh_prs
+        .iter()
+        .map(|p| {
+            // Derive ciConclusion from statusCheckRollup (array of check objects).
+            let ci_conclusion = pr_ci_conclusion(p.get("statusCheckRollup"));
+            // Author may be a string or {"login":"..."} object.
+            let author = p
+                .get("author")
+                .and_then(|a| {
+                    a.get("login")
+                        .and_then(|l| l.as_str())
+                        .or_else(|| a.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            json!({
+                "number":        p.get("number").and_then(|v| v.as_i64()).unwrap_or(0),
+                "title":         p.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "isDraft":       p.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false),
+                "reviewDecision":p.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or(""),
+                "ciConclusion":  ci_conclusion,
+                "additions":     p.get("additions").and_then(|v| v.as_i64()).unwrap_or(0),
+                "deletions":     p.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0),
+                "changedFiles":  p.get("changedFiles").and_then(|v| v.as_i64()).unwrap_or(0),
+                "headBranch":    p.get("headRefName").and_then(|v| v.as_str()).unwrap_or(""),
+                "author":        author,
+                "updatedAt":     p.get("updatedAt").and_then(|v| v.as_str()).unwrap_or(""),
+                "url":           p.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        })
+        .collect();
+
+    let prs_len = prs.len();
+    let event = json!({ "type": "prList", "prs": prs });
+
+    log!("[github-actions] emitting prList ({} PRs)", prs_len);
+    event.to_string()
+}
+
+/// Determine a rolled-up CI conclusion from a PR's statusCheckRollup array.
+fn pr_ci_conclusion(rollup: Option<&serde_json::Value>) -> &'static str {
+    let arr = match rollup.and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return "unknown",
+    };
+    let mut any_failure = false;
+    let mut any_pending = false;
+    for check in arr {
+        let status = check
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_lowercase();
+        let conclusion = check
+            .get("conclusion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match status.as_str() {
+            "in_progress" | "queued" | "waiting" | "pending" => {
+                any_pending = true;
+            }
+            "completed" => match conclusion.as_str() {
+                "failure" | "timed_out" => any_failure = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if any_pending {
+        "inProgress"
+    } else if any_failure {
+        "failure"
+    } else {
+        "success"
+    }
+}
+
+fn fetch_pr_details(number: i64, workspace_root: &str) {
+    log!("[github-actions] fetch_pr_details: number={}", number);
+
+    let number_str = number.to_string();
+    let cwd = if workspace_root.is_empty() {
+        None
+    } else {
+        Some(workspace_root)
+    };
+
+    let child = match ChildProcess::spawn(
+        "gh",
+        vec![
+            "pr",
+            "view",
+            &number_str,
+            "--json",
+            "reviews,statusCheckRollup,files",
+        ],
+        cwd,
+        HashMap::new(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            log!("[github-actions] gh pr view spawn failed: {:?}", e);
+            return;
+        }
+    };
+
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    loop {
+        child.wait_for_data(300);
+        loop {
+            match child.read(PipeType::Stdout) {
+                Ok(ReadResult::Data(d)) => stdout_buf.extend(d),
+                _ => break,
+            }
+        }
+        match child.get_status() {
+            ProcessStatus::Running => {}
+            _ => {
+                loop {
+                    match child.read(PipeType::Stdout) {
+                        Ok(ReadResult::Data(d)) => stdout_buf.extend(d),
+                        _ => break,
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&stdout_buf);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let gh_resp: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            log!("[github-actions] JSON parse error for pr view: {}", e);
+            return;
+        }
+    };
+
+    let empty_arr = serde_json::Value::Array(vec![]);
+
+    // reviews
+    let gh_reviews = gh_resp
+        .get("reviews")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| match &empty_arr {
+            serde_json::Value::Array(a) => a,
+            _ => unreachable!(),
+        });
+    let reviews: Vec<serde_json::Value> = gh_reviews
+        .iter()
+        .map(|r| {
+            let author = r
+                .get("author")
+                .and_then(|a| {
+                    a.get("login")
+                        .and_then(|l| l.as_str())
+                        .or_else(|| a.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            json!({
+                "author":      author,
+                "state":       r.get("state").and_then(|v| v.as_str()).unwrap_or(""),
+                "submittedAt": r.get("submittedAt").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        })
+        .collect();
+
+    // checks
+    let gh_checks = gh_resp
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| match &empty_arr {
+            serde_json::Value::Array(a) => a,
+            _ => unreachable!(),
+        });
+    let checks: Vec<serde_json::Value> = gh_checks
+        .iter()
+        .map(|c| {
+            json!({
+                "name":       c.get("name").and_then(|v| v.as_str()).unwrap_or("check"),
+                "status":     c.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "conclusion": c.get("conclusion").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        })
+        .collect();
+
+    // changed files
+    let gh_files = gh_resp
+        .get("files")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| match &empty_arr {
+            serde_json::Value::Array(a) => a,
+            _ => unreachable!(),
+        });
+    let changed_files: Vec<serde_json::Value> = gh_files
+        .iter()
+        .map(|f| {
+            json!({
+                "path":      f.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                "additions": f.get("additions").and_then(|v| v.as_i64()).unwrap_or(0),
+                "deletions": f.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
+    let event = json!({
+        "type":         "prDetails",
+        "number":       number,
+        "reviews":      reviews,
+        "checks":       checks,
+        "changedFiles": changed_files,
+    });
+
+    log!(
+        "[github-actions] emitting prDetails for #{} ({} reviews, {} checks, {} files)",
+        number,
+        reviews.len(),
+        checks.len(),
+        changed_files.len()
     );
 
     push_raw_event("", &event.to_string());
